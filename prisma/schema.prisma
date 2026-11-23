@@ -1,0 +1,595 @@
+// Rootellect AI OS — control-plane database.
+// Separate from the rootellect.com storefront database by design.
+//
+// PostgreSQL (Neon in production, any Postgres locally). Enums and JSON are stored
+// as text and validated in code (src/core/db/json.ts) so the schema stays portable.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Identity ─────────────────────────────
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String
+  passwordHash String
+  role         String    @default("FOUNDER") // FOUNDER | OPERATOR | VIEWER
+  phone        String?   // E.164, used for WhatsApp/voice escalation
+  mfaSecret    String?   // encrypted TOTP secret (optional MFA)
+  createdAt    DateTime  @default(now())
+  lastLoginAt  DateTime?
+  sessions     Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  userAgent String?
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ───────────────────────────── Organization ─────────────────────────────
+
+model Department {
+  id          String  @id @default(cuid())
+  code        String  @unique // A..I
+  name        String
+  description String
+  sortOrder   Int     @default(0)
+  agents      Agent[]
+  tasks       Task[]
+}
+
+model Agent {
+  id                 String   @id @default(cuid())
+  code               String   @unique // e.g. "A01"
+  slug               String   @unique
+  name               String   // display name, e.g. "AI Chief of Staff"
+  departmentId       String
+  managerId          String?
+  isManager          Boolean  @default(false)
+  description        String
+  responsibilities   String   @default("[]") // json string[]
+  kpis               String   @default("[]") // json string[]
+  tools              String   @default("[]") // json string[] — tool keys this agent may request
+  deliverables       String   @default("[]") // json string[]
+  validationRules    String   @default("[]") // json string[]
+  escalation         String   @default("[]") // json string[]
+  instructions       String   @default("")
+  providerPrimary    String   @default("anthropic") // openai | anthropic | gemini
+  providerFallback   String   @default("openai")
+  modelTier          String   @default("balanced") // fast | balanced | deep
+  status             String   @default("SHADOW") // ACTIVE | SHADOW | PAUSED | RETIRED
+  maxAutonomousRisk  Int      @default(1) // highest risk level it may execute without approval (0..2)
+  dailyTokenBudget   Int      @default(200000)
+  monthlyBudgetInr   Float    @default(1500)
+  version            Int      @default(1)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  department Department     @relation(fields: [departmentId], references: [id])
+  manager    Agent?         @relation("Reports", fields: [managerId], references: [id])
+  reports    Agent[]        @relation("Reports")
+  versions   AgentVersion[]
+  tasks      Task[]
+}
+
+model AgentVersion {
+  id         String   @id @default(cuid())
+  agentId    String
+  version    Int
+  snapshot   String   // json of the agent config at this version
+  changeNote String
+  changedBy  String
+  createdAt  DateTime @default(now())
+  agent      Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([agentId, version])
+}
+
+// ───────────────────────────── Work ─────────────────────────────
+
+model Project {
+  id          String   @id @default(cuid())
+  title       String
+  objective   String
+  status      String   @default("ACTIVE") // ACTIVE | DONE | CANCELLED
+  createdBy   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  tasks       Task[]
+}
+
+model Task {
+  id                  String    @id @default(cuid())
+  projectId           String?
+  parentId            String?
+  title               String
+  objective           String
+  ownerAgentId        String?
+  departmentId        String?
+  source              String    // founder | schedule | webhook | agent | workflow
+  trigger             String    @default("")
+  inputs              String    @default("{}") // json
+  expectedDeliverable String    @default("")
+  acceptanceCriteria  String    @default("[]") // json string[]
+  requiredTools       String    @default("[]") // json string[]
+  riskLevel           Int       @default(0)
+  priority            Int       @default(3) // 1 (highest) .. 5
+  status              String    @default("NEW")
+  statusReason        String?
+  dueAt               DateTime?
+  estCostInr          Float     @default(0)
+  actualCostInr       Float     @default(0)
+  output              String?   // json — latest deliverable
+  testResults         String    @default("[]") // json
+  evidence            String    @default("[]") // json [{kind, ref, note}]
+  dedupeKey           String?   @unique
+  attempts            Int       @default(0)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  completedAt         DateTime?
+
+  project      Project?         @relation(fields: [projectId], references: [id])
+  parent       Task?            @relation("Subtasks", fields: [parentId], references: [id])
+  subtasks     Task[]           @relation("Subtasks")
+  owner        Agent?           @relation(fields: [ownerAgentId], references: [id])
+  department   Department?      @relation(fields: [departmentId], references: [id])
+  dependsOn    TaskDependency[] @relation("TaskDeps")
+  dependedBy   TaskDependency[] @relation("TaskDepTargets")
+  events       TaskEvent[]
+}
+
+model TaskDependency {
+  id          String @id @default(cuid())
+  taskId      String
+  dependsOnId String
+  task        Task   @relation("TaskDeps", fields: [taskId], references: [id], onDelete: Cascade)
+  dependsOn   Task   @relation("TaskDepTargets", fields: [dependsOnId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, dependsOnId])
+}
+
+model TaskEvent {
+  id        String   @id @default(cuid())
+  taskId    String
+  fromState String?
+  toState   String
+  actor     String   // "founder:<id>" | "agent:<code>" | "system"
+  note      String   @default("")
+  createdAt DateTime @default(now())
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+}
+
+// Each model call or tool call made while working on something.
+model Execution {
+  id            String    @id @default(cuid())
+  kind          String    // model | tool
+  taskId        String?
+  workflowRunId String?
+  agentCode     String?
+  toolKey       String?
+  provider      String?
+  model         String?
+  status        String    // RUNNING | SUCCEEDED | FAILED | BLOCKED | SIMULATED
+  input         String    @default("{}")
+  output        String?
+  error         String?
+  costInr       Float     @default(0)
+  startedAt     DateTime  @default(now())
+  endedAt       DateTime?
+
+  @@index([taskId])
+  @@index([workflowRunId])
+}
+
+// ───────────────────────────── Durable workflows ─────────────────────────────
+
+model WorkflowRun {
+  id           String    @id @default(cuid())
+  workflowType String
+  status       String    @default("PENDING") // PENDING | RUNNING | WAITING | COMPLETED | FAILED | CANCELLED
+  input        String    @default("{}")
+  result       String?
+  error        String?
+  waitingFor   String?   // json {kind:"approval", id} | {kind:"timer", until}
+  taskId       String?
+  dedupeKey    String?   @unique
+  attempts     Int       @default(0)
+  nextRunAt    DateTime  @default(now())
+  lockedBy     String?
+  lockedUntil  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  checkpoints  Checkpoint[]
+
+  @@index([status, nextRunAt])
+}
+
+model Checkpoint {
+  id        String   @id @default(cuid())
+  runId     String
+  stepKey   String
+  status    String   // DONE | FAILED
+  output    String?
+  attempt   Int      @default(1)
+  createdAt DateTime @default(now())
+  run       WorkflowRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, stepKey])
+}
+
+// Guards external side-effects (payments, messages, publishes) against duplicates.
+model IdempotencyRecord {
+  key       String   @id
+  scope     String
+  status    String   // STARTED | DONE | FAILED
+  result    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Schedule {
+  id           String    @id @default(cuid())
+  name         String    @unique
+  workflowType String
+  cron         String    // 5-field cron, evaluated in Asia/Kolkata
+  input        String    @default("{}")
+  enabled      Boolean   @default(true)
+  lastRunAt    DateTime?
+  nextRunAt    DateTime?
+  description  String    @default("")
+}
+
+model Heartbeat {
+  component String   @id // worker | watchdog | notifier
+  beatAt    DateTime
+  info      String   @default("{}")
+}
+
+// ───────────────────────────── AI providers & debates ─────────────────────────────
+
+model ModelProvider {
+  id             String    @id @default(cuid())
+  provider       String    @unique // openai | anthropic | gemini
+  encryptedKey   String?
+  keyHint        String?   // last 4 chars only
+  enabled        Boolean   @default(false)
+  status         String    @default("NOT_CONFIGURED") // NOT_CONFIGURED | CONNECTED | ERROR
+  models         String    @default("[]") // json — discovered model ids
+  tierModels     String    @default("{}") // json {fast, balanced, deep}
+  rateLimitPerMin Int      @default(30)
+  inrPerUsd      Float     @default(84)
+  priceTable     String    @default("{}") // json {modelId: {inPerMTok, outPerMTok}} in USD
+  lastTestedAt   DateTime?
+  lastError      String?
+  updatedAt      DateTime  @updatedAt
+}
+
+model ModelUsage {
+  id         String   @id @default(cuid())
+  provider   String
+  model      String
+  agentCode  String?
+  taskId     String?
+  debateId   String?
+  tokensIn   Int      @default(0)
+  tokensOut  Int      @default(0)
+  costInr    Float    @default(0)
+  costVerified Boolean @default(false) // false when price table missing → estimate shown separately
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([agentCode])
+}
+
+model Debate {
+  id             String   @id @default(cuid())
+  taskId         String?
+  question       String
+  context        String   @default("")
+  status         String   @default("RUNNING") // RUNNING | DONE | FAILED
+  panel          String   @default("[]") // json providers used
+  options        String   @default("[]") // json canonical options after round 2
+  outcome        String?  // CONSENSUS_SUPPORTED | CONSENSUS_UNVERIFIED | MAJORITY | SPLIT | REDUCED_PANEL | FAILED
+  recommendation String?
+  dissent        String?
+  scores         String   @default("{}")
+  costInr        Float    @default(0)
+  createdAt      DateTime @default(now())
+  finishedAt     DateTime?
+  rounds         DebateRound[]
+}
+
+model DebateRound {
+  id        String   @id @default(cuid())
+  debateId  String
+  round     Int
+  provider  String
+  alias     String   // anonymized label shown to peers, e.g. "Analyst B"
+  content   String   // json
+  createdAt DateTime @default(now())
+  debate    Debate   @relation(fields: [debateId], references: [id], onDelete: Cascade)
+
+  @@index([debateId, round])
+}
+
+model Decision {
+  id        String   @id @default(cuid())
+  debateId  String?
+  title     String
+  summary   String
+  status    String   @default("PROPOSED") // PROPOSED | APPROVED | REJECTED
+  createdAt DateTime @default(now())
+}
+
+// ───────────────────────────── Approvals ─────────────────────────────
+
+model ApprovalRequest {
+  id             String    @id @default(cuid())
+  shortCode      String    @unique // human-friendly code for WhatsApp, e.g. "AP-7K2Q"
+  title          String
+  agentCode      String
+  department     String
+  taskId         String?
+  workflowRunId  String?
+  toolKey        String
+  params         String    // exact json parameters that will be executed
+  paramsHash     String    // sha256 of canonical params — execution must match
+  riskLevel      Int
+  reason         String
+  evidence       String    @default("[]")
+  expectedImpact String    @default("")
+  estCostInr     Float     @default(0)
+  riskAssessment String    @default("")
+  rollbackPlan   String    @default("")
+  recommendation String    @default("")
+  status         String    @default("PENDING") // PENDING | APPROVED | REJECTED | CHANGES_REQUESTED | DEFERRED | DELEGATED | EXPIRED | EXECUTED | EXECUTION_FAILED
+  urgency        String    @default("normal") // low | normal | high | critical
+  expiresAt      DateTime
+  decidedAt      DateTime?
+  decidedBy      String?
+  decisionNote   String?
+  executedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  events         ApprovalEvent[]
+
+  @@index([status])
+}
+
+model ApprovalEvent {
+  id         String   @id @default(cuid())
+  approvalId String
+  event      String
+  actor      String
+  channel    String   // dashboard | whatsapp | email | system
+  note       String   @default("")
+  createdAt  DateTime @default(now())
+  approval   ApprovalRequest @relation(fields: [approvalId], references: [id], onDelete: Cascade)
+}
+
+model ToolPolicy {
+  toolKey          String   @id
+  riskLevel        Int      // 0..4 — enforced by the gateway, not prompts
+  standingApproval Boolean  @default(false) // level-2 pre-authorization
+  capInr           Float?   // per-action spend cap under standing approval
+  dailyCapInr      Float?
+  enabled          Boolean  @default(true)
+  updatedBy        String   @default("system")
+  updatedAt        DateTime @updatedAt
+}
+
+// ───────────────────────────── Integrations ─────────────────────────────
+
+model Connector {
+  id              String    @id @default(cuid())
+  key             String    @unique
+  name            String
+  category        String
+  status          String    @default("DISCONNECTED") // CONNECTED | DEGRADED | TOKEN_EXPIRED | PERMISSION_REQUIRED | DISCONNECTED
+  encryptedConfig String?
+  configHint      String?
+  capabilities    String    @default("[]")
+  lastCheckAt     DateTime?
+  lastError       String?
+  updatedAt       DateTime  @updatedAt
+}
+
+// ───────────────────────────── Business data ─────────────────────────────
+
+model BusinessMetric {
+  id         String   @id @default(cuid())
+  key        String   // e.g. revenue_inr, orders, ad_spend_meta_inr
+  value      Float
+  unit       String   // INR | count | pct | ratio
+  periodStart DateTime
+  periodEnd   DateTime
+  source     String   // connector key, or "manual"
+  verified   Boolean  @default(true) // false = estimate; shown separately
+  note       String   @default("")
+  capturedAt DateTime @default(now())
+
+  @@index([key, periodStart])
+}
+
+model ProductCost {
+  sku          String   @id
+  name         String
+  unitCostInr  Float?   // null = not configured; never silently estimated
+  packagingInr Float?
+  updatedAt    DateTime @updatedAt
+}
+
+model Alert {
+  id         String    @id @default(cuid())
+  severity   String    // SEV1 | SEV2 | SEV3 | INFO
+  title      String
+  detail     String    @default("")
+  source     String
+  status     String    @default("OPEN") // OPEN | ACKED | RESOLVED
+  dedupeKey  String?   @unique
+  incidentId String?
+  count      Int       @default(1)
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  ackedAt    DateTime?
+}
+
+model Incident {
+  id        String    @id @default(cuid())
+  title     String
+  severity  String
+  status    String    @default("OPEN") // OPEN | MITIGATED | RESOLVED
+  summary   String    @default("")
+  rootCause String    @default("")
+  timeline  String    @default("[]") // json [{at, actor, note}]
+  owners    String    @default("[]")
+  createdAt DateTime  @default(now())
+  resolvedAt DateTime?
+}
+
+model Notification {
+  id         String    @id @default(cuid())
+  channel    String    // email | whatsapp | voice | dashboard
+  recipient  String
+  subject    String    @default("")
+  body       String
+  status     String    @default("QUEUED") // QUEUED | SENT | FAILED | SUPPRESSED | ACKED
+  dedupeKey  String?   @unique
+  severity   String    @default("INFO")
+  attempts   Int       @default(0)
+  error      String?
+  alertId    String?
+  approvalId String?
+  createdAt  DateTime  @default(now())
+  sentAt     DateTime?
+  ackedAt    DateTime?
+}
+
+model CalendarEvent {
+  id         String   @id @default(cuid())
+  title      String
+  startsAt   DateTime
+  endsAt     DateTime?
+  kind       String   @default("meeting") // meeting | deadline | launch | review | reminder
+  source     String   @default("manual")
+  externalId String?  @unique
+  notes      String   @default("")
+}
+
+// ───────────────────────────── Knowledge ─────────────────────────────
+
+model Document {
+  id        String   @id @default(cuid())
+  title     String
+  source    String
+  mime      String   @default("text/plain")
+  content   String
+  createdAt DateTime @default(now())
+}
+
+model KnowledgeEntry {
+  id           String    @id @default(cuid())
+  title        String
+  body         String
+  category     String    // company | product | claims | brand | sop | decision | incident | preference | strategy
+  verified     Boolean   @default(false) // verified business fact vs. model-generated assumption
+  source       String    // founder | document:<id> | agent:<code> | connector:<key>
+  provenance   String    @default("")
+  accessScope  String    @default("all") // all | founder | dept:<code>
+  version      Int       @default(1)
+  supersededBy String?
+  expiresAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([category])
+}
+
+// ───────────────────────────── QA & browser ─────────────────────────────
+
+model BrowserSession {
+  id        String    @id @default(cuid())
+  mode      String    // synthetic | playwright | ai-browser | human
+  target    String
+  environment String  @default("production") // production | staging
+  status    String    @default("RUNNING")
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+  summary   String    @default("")
+}
+
+model TestResult {
+  id         String   @id @default(cuid())
+  runId      String   // groups one suite execution
+  suite      String
+  check      String
+  target     String
+  status     String   // PASS | FAIL | WARN | SKIP
+  detail     String   @default("")
+  durationMs Int      @default(0)
+  evidence   String   @default("[]")
+  createdAt  DateTime @default(now())
+
+  @@index([runId])
+  @@index([createdAt])
+}
+
+model Artifact {
+  id        String   @id @default(cuid())
+  kind      String   // report | screenshot | trace | log | creative | code
+  title     String
+  path      String?  // relative path under ARTIFACTS_DIR (worker host only)
+  content   String?
+  data      Bytes?   // binary evidence (screenshots, traces) stored in the DB so the dashboard can serve it from any host
+  sizeBytes Int      @default(0)
+  mime      String   @default("text/markdown")
+  taskId    String?
+  createdAt DateTime @default(now())
+}
+
+// ───────────────────────────── Audit, budgets, settings ─────────────────────────────
+
+// Append-only, hash-chained. Each row's hash covers the previous row's hash.
+model AuditEvent {
+  seq        Int      @id @default(autoincrement())
+  actor      String
+  action     String
+  entityType String
+  entityId   String   @default("")
+  data       String   @default("{}")
+  prevHash   String
+  hash       String
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
+
+model Budget {
+  id       String @id @default(cuid())
+  scope    String // company | department | agent | provider
+  scopeRef String @default("*")
+  period   String // daily | monthly
+  limitInr Float
+
+  @@unique([scope, scopeRef, period])
+}
+
+model Setting {
+  key       String   @id
+  value     String
+  updatedBy String   @default("system")
+  updatedAt DateTime @updatedAt
+}

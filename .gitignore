@@ -1,0 +1,16 @@
+node_modules/
+.next/
+data/
+artifacts/
+src/generated/
+.env
+.env.local
+*.db
+*.db-journal
+next-env.d.ts
+*.tsbuildinfo
+backups/
+.neon
+.neon/cache
+push-log.txt
+push-to-github.bat

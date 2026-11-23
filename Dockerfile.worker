@@ -1,0 +1,18 @@
+# Rootellect AI OS — worker (schedules, durable workflows, notifications, Playwright QA).
+# Playwright's image ships Chromium + system deps; keep its tag in step with package.json's playwright.
+FROM mcr.microsoft.com/playwright:v1.65.1-noble
+
+WORKDIR /app
+ENV NODE_ENV=production \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    ARTIFACTS_DIR=/app/artifacts
+
+COPY package.json package-lock.json ./
+COPY prisma ./prisma
+COPY prisma.config.ts ./
+RUN npm ci --include=dev --ignore-scripts && npx prisma generate
+
+COPY . .
+
+# Migrations run from the dashboard's Vercel build (vercel-build). The worker only reads/writes.
+CMD ["npm", "run", "worker"]
